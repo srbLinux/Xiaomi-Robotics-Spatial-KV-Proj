@@ -301,6 +301,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--workers", type=int, default=8)
+    p.add_argument("--devices", type=int, default=8)
     p.add_argument("--max-steps", type=int, default=100000)
     p.add_argument("--val-batches", type=int, default=16)
     p.add_argument("--output-dir", type=Path, default=Path("/data-cfs/data3/shurenbin/Xiaomi-Robotics-Spatial/train/xr1_official20/spatial"))
@@ -321,7 +322,7 @@ def main():
     from lightning.pytorch.strategies import DeepSpeedStrategy
     from lightning.pytorch.callbacks import ModelCheckpoint
     checkpoint = ModelCheckpoint(dirpath=str(args.output_dir / "checkpoints"), every_n_train_steps=2000, save_top_k=-1, save_last=True, enable_version_counter=False)
-    trainer = Trainer(accelerator="cuda", devices=3, num_nodes=1, precision="bf16-mixed", strategy=DeepSpeedStrategy(), max_steps=args.max_steps, default_root_dir=str(args.output_dir), accumulate_grad_batches=1, gradient_clip_val=1.0, log_every_n_steps=10, val_check_interval=1000, check_val_every_n_epoch=None, limit_val_batches=args.val_batches, callbacks=[checkpoint], enable_checkpointing=True)
+    trainer = Trainer(accelerator="cuda", devices=args.devices, num_nodes=1, precision="bf16-mixed", strategy=DeepSpeedStrategy(), max_steps=args.max_steps, default_root_dir=str(args.output_dir), accumulate_grad_batches=1, gradient_clip_val=1.0, log_every_n_steps=10, val_check_interval=1000, check_val_every_n_epoch=None, limit_val_batches=args.val_batches, callbacks=[checkpoint], enable_checkpointing=True)
     trainer.fit(runner, datamodule=data)
 
 
