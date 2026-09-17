@@ -1,0 +1,6 @@
+{
+  "auto_map": {
+    "AutoProcessor": "processing_mibot.MiBotProcessor"
+  },
+  "processor_class": "MiBotProcessor"
+}

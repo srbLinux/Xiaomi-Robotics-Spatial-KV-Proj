@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Official XR-1 post-training on the verified RoboCasa365 20-task split.
+"""Independent XR-1 base-checkpoint post-training on the RoboCasa365 SF10 subset.
 
 This file deliberately keeps the training mathematics in clean ``mibot``:
 the only model call used for training is ``model(batch, return_loss=True)``.
@@ -22,6 +22,7 @@ import pyarrow.parquet as pq
 import torch
 from PIL import Image
 from lightning.pytorch import LightningDataModule
+from lightning.pytorch.callbacks import Callback
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from torch.utils.data.dataloader import default_collate
 from transformers import AutoProcessor, AutoTokenizer, Qwen2VLImageProcessor, Qwen3VLProcessor, Qwen3VLVideoProcessor
@@ -38,7 +39,7 @@ DATA_ROOT = Path("/data-cfs/data3/datasets/robocasa365-datasets/pretrain")
 MANIFEST = Path("/data-cfs/data3/shurenbin/Xiaomi-Robotics-Spatial/train/esm_kv_injection/xr1_base_spatial20_full_dit_20260913/manifests/spatial20_train_val_95_5_20260913.jsonl")
 META = Path(str(MANIFEST) + ".meta.json")
 MODEL_CKPT = Path("/data-cfs/data3/models/Xiaomi-Robotics-1-5B/model_states.pt")
-PROCESSOR = Path("/data-cfs/data3/models/Xiaomi-Robotics-1-RoboCasa365")
+PROCESSOR = Path(__file__).resolve().parent / "processor"
 TASKS = (
     "StackBowlsCabinet", "PrepareCoffee", "SearingMeat", "RinseSinkBasin",
     "SetUpCuttingStation", "StoreLeftoversInBowl", "LoadDishwasher",
@@ -94,22 +95,86 @@ def remap_path(path: str) -> str:
     return path
 
 
+def _expand_episode_manifest_row(source: dict) -> list[dict]:
+    task = str(source["task_name"])
+    episode_dir = Path(source["trajectory_path"]).resolve()
+    if not episode_dir.is_dir():
+        raise FileNotFoundError(f"trajectory_path is not a directory: {episode_dir}")
+    episode_id = int(source["episode_id"])
+    expected_name = f"episode_{episode_id:06d}"
+    if episode_dir.name != expected_name:
+        raise RuntimeError(f"{task}: episode path/id mismatch: {episode_dir.name} vs {expected_name}")
+    lerobot_root = episode_dir.parents[1]
+    parquet = lerobot_root / "data" / "chunk-000" / f"{expected_name}.parquet"
+    if not parquet.is_file():
+        raise FileNotFoundError(f"missing trajectory parquet: {parquet}")
+    ep_meta = episode_dir / "ep_meta.json"
+    if not ep_meta.is_file():
+        raise FileNotFoundError(f"missing episode metadata: {ep_meta}")
+    instruction = json.loads(ep_meta.read_text()).get("lang")
+    if not instruction:
+        raise RuntimeError(f"{task} episode {episode_id}: ep_meta.json has no lang instruction")
+    camera_paths = {
+        LEFT: lerobot_root / "videos" / "chunk-000" / LEFT / f"{expected_name}.mp4",
+        RIGHT: lerobot_root / "videos" / "chunk-000" / RIGHT / f"{expected_name}.mp4",
+        WRIST: lerobot_root / "videos" / "chunk-000" / WRIST / f"{expected_name}.mp4",
+    }
+    for view, path in camera_paths.items():
+        if not path.is_file():
+            raise FileNotFoundError(f"{task} episode {episode_id}: missing {view} video: {path}")
+    frame_count = int(pq.read_metadata(str(parquet)).num_rows)
+    if frame_count <= 0:
+        raise RuntimeError(f"{task} episode {episode_id}: empty parquet")
+    return [
+        {
+            "camera_paths": {view: str(path) for view, path in camera_paths.items()},
+            "episode_id": episode_id,
+            "episode_key": f"{task}:{episode_id}",
+            "frame_index": frame,
+            "instruction": str(instruction),
+            "sample_id": f"{task}_ep{episode_id:06d}_f{frame:06d}",
+            "split": str(source["split"]),
+            "task": task,
+            "trajectory_path": str(episode_dir),
+        }
+        for frame in range(frame_count)
+    ]
+
+
 def load_rows() -> dict[str, list[dict]]:
-    meta = json.loads(META.read_text())
-    if tuple(meta.get("tasks", ())) != TASKS or meta.get("task_count") != 20:
-        raise RuntimeError("verified exact-20 manifest metadata mismatch")
-    rows = {"train": [], "val": []}
-    for line in MANIFEST.open():
-        row = json.loads(line)
-        if row.get("task") in TASKS and row.get("split") in rows:
-            row["camera_paths"] = {k: remap_path(v) for k, v in row["camera_paths"].items()}
-            rows[row["split"]].append(row)
-    if any(not rows[k] for k in rows):
-        raise RuntimeError("verified train/val split is empty")
-    train_eps = {(r["task"], int(r["episode_id"])) for r in rows["train"]}
-    val_eps = {(r["task"], int(r["episode_id"])) for r in rows["val"]}
+    if not MANIFEST.is_file():
+        raise FileNotFoundError(MANIFEST)
+    meta_path = META if META.is_file() else MANIFEST.parent / "train.meta.json"
+    meta = json.loads(meta_path.read_text())
+    if meta.get("tasks") != list(TASKS) or meta.get("num_tasks") != 10:
+        raise RuntimeError(f"SF10 metadata mismatch: {meta}")
+    source_rows = [json.loads(line) for line in MANIFEST.read_text().splitlines() if line.strip()]
+    expected_fields = {"task_name", "episode_id", "trajectory_path", "split"}
+    if any(set(row) != expected_fields for row in source_rows):
+        raise RuntimeError("manifest row schema mismatch")
+    if {row["task_name"] for row in source_rows} != set(TASKS):
+        raise RuntimeError("manifest does not contain all 10 required tasks")
+    train_eps = {(row["task_name"], int(row["episode_id"])) for row in source_rows if row["split"] == "train"}
+    val_eps = {(row["task_name"], int(row["episode_id"])) for row in source_rows if row["split"] == "val"}
     if train_eps & val_eps:
-        raise RuntimeError("episode leakage detected")
+        raise RuntimeError("episode leakage in SF10 trajectory manifest")
+    for task in TASKS:
+        task_val = {(row["task_name"], int(row["episode_id"])) for row in source_rows
+                    if row["task_name"] == task and row["split"] == "val"}
+        if len(task_val) != 2:
+            raise RuntimeError(f"{task}: expected exactly two validation episodes, got {len(task_val)}")
+    rows = {"train": [], "val": []}
+    for source in source_rows:
+        if source["split"] not in rows:
+            raise RuntimeError(f"unexpected split: {source['split']}")
+        rows[source["split"]].extend(_expand_episode_manifest_row(source))
+    if not rows["train"] or not rows["val"]:
+        raise RuntimeError("expanded SF10 train/val rows are empty")
+    print(json.dumps({
+        "tasks": list(TASKS), "train_frames": len(rows["train"]), "val_frames": len(rows["val"]),
+        "train_episodes": len(train_eps), "val_episodes": len(val_eps),
+        "split_rule": "last_two_episode_val", "episode_disjoint": True,
+    }), flush=True)
     return rows
 
 
@@ -499,35 +564,91 @@ def write_audit(out: Path, processor, rows, args):
     (out / "official_source_audit.md").write_text(f"# Official XR-1 source audit\n\n- clean commit: `0dd7aef8dc87296246aae812a1f59ccb708e5546`\n- model: `xr1/mibot/models/VLA/XR1.py`\n- runner: `xr1/mibot/models/runner/base_runner.py`\n- collate reference: `xr1/mibot/data/collate/custom_collate.py`\n- official call: `model(batch, return_loss=True)`\n- official losses: flow MSE, frequency, choice, score\n- official repeat/async: `training_repeat=4`, `async_train=true`\n- official optimizer: DeepSpeed FusedAdam, official no-decay grouping\n- official scheduler: cosine warmup, 500 warmup steps, 2e-5 max, 5e-6 min\n- RoboCasa contract: state `[B,4,60]`, action `[B,16,60]`, active dims from processor metadata\n- manifest: `{MANIFEST}`\n- GPU: 3 processes, per-GPU batch `{args.batch_size}`, GPU prefetch `{args.gpu_prefetch}`\n")
 
 
+
+class SuccessEvaluationCallback(Callback):
+    """Log externally produced task success rates when --success-eval-json is set."""
+
+    def __init__(self, path):
+        super().__init__()
+        self.path = Path(path) if path else None
+        self._reported_missing = False
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        if self.path is None:
+            return
+        if not self.path.is_file():
+            if trainer.is_global_zero and not self._reported_missing:
+                print(json.dumps({"success_evaluation": "not_available", "path": str(self.path)}), flush=True)
+                self._reported_missing = True
+            return
+        payload = json.loads(self.path.read_text())
+        rates = payload.get("task_success", payload)
+        rates = {str(k): float(v) for k, v in rates.items() if str(k) in TASKS}
+        if not rates:
+            raise RuntimeError(f"success evaluation file has no task rates: {self.path}")
+        mean_rate = sum(rates.values()) / len(rates)
+        pl_module.log("val/success_eval_mean", mean_rate, sync_dist=False)
+        if trainer.is_global_zero:
+            print(json.dumps({"success_evaluation": rates, "success_eval_mean": mean_rate}), flush=True)
+
+
 def main():
+    global DATA_ROOT, MANIFEST, META, MODEL_CKPT, PROCESSOR
     p = argparse.ArgumentParser()
-    p.add_argument("--batch-size", type=int, default=20)
-    p.add_argument("--workers", type=int, default=8)
-    p.add_argument("--devices", type=int, default=3)
-    p.add_argument("--max-steps", type=int, default=40000)
+    p.add_argument("--manifest", type=Path, default=MANIFEST)
+    p.add_argument("--dataset-root", type=Path, default=DATA_ROOT)
+    p.add_argument("--model-ckpt", type=Path, default=MODEL_CKPT)
+    p.add_argument("--processor", type=Path, default=PROCESSOR)
+    p.add_argument("--batch-size", type=int, default=24)
+    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--devices", type=int, default=2)
+    p.add_argument("--max-steps", type=int, default=20000)
+    p.add_argument("--gradient-accumulation", type=int, default=1)
     p.add_argument("--val-batches", type=int, default=16)
-    p.add_argument("--output-dir", type=Path, default=Path("/data-cfs/data3/shurenbin/Xiaomi-Robotics-Spatial/train/xr1_official20/baseline"))
+    p.add_argument("--output-dir", type=Path, default=Path(__file__).resolve().parent / "runs" / "baseline")
+    p.add_argument("--checkpoint-dir", type=Path, default=Path(__file__).resolve().parent / "checkpoints" / "baseline")
+    p.add_argument("--log-dir", type=Path, default=Path(__file__).resolve().parent / "logs" / "baseline")
     p.add_argument("--target-gpu-gb", type=float, default=70.0)
     p.add_argument("--limit-gpu-gb", type=float, default=70.0)
+    p.add_argument("--success-eval-json", type=Path, default=None)
     p.add_argument("--no-gpu-prefetch", dest="gpu_prefetch", action="store_false")
-    p.set_defaults(gpu_prefetch=True)
     p.add_argument("--audit-only", action="store_true")
     args = p.parse_args()
+    DATA_ROOT, MANIFEST, MODEL_CKPT, PROCESSOR = args.dataset_root, args.manifest, args.model_ckpt, args.processor
+    META = MANIFEST.parent / "train.meta.json"
+    for directory in (args.output_dir, args.checkpoint_dir, args.log_dir):
+        directory.mkdir(parents=True, exist_ok=True)
     random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
-    args.output_dir.mkdir(parents=True, exist_ok=True)
     stats_processor = build_action_stats_processor()
     processor = build_official_qwen_processor()
     rows = load_rows()
     write_audit(args.output_dir, stats_processor, rows, args)
-    print(json.dumps({"mode": "baseline", "tasks": list(TASKS), "train_rows": len(rows["train"]), "val_rows": len(rows["val"]), "state_shape": ["B", 4, 60], "action_shape": ["B", 16, 60], "per_gpu_batch_size": args.batch_size, "gpu_prefetch": args.gpu_prefetch}), flush=True)
-    if args.audit_only: return
+    print(json.dumps({
+        "mode": "official_posttrain_baseline",
+        "base_checkpoint": str(MODEL_CKPT),
+        "robo_casa365_checkpoint_used": False,
+        "tasks": list(TASKS), "train_rows": len(rows["train"]), "val_rows": len(rows["val"]),
+        "per_gpu_batch_size": args.batch_size, "global_batch_size": args.batch_size * args.devices * args.gradient_accumulation,
+        "gradient_accumulation": args.gradient_accumulation, "history": 4, "interval": 2,
+        "views": ["LEFT", "RIGHT", "WRIST"], "crop_ratio": 0.95, "action_horizon": 16,
+        "loss": "official policy loss: flow/frequency/choice/score",
+    }), flush=True)
+    if args.audit_only:
+        return
     data = Official20Data(rows, processor, args.batch_size, args.workers, args.gpu_prefetch, stats_processor)
     runner = Official20Runner(MODEL_CKPT, args.max_steps, args.target_gpu_gb, args.limit_gpu_gb)
     from lightning import Trainer
     from lightning.pytorch.strategies import DeepSpeedStrategy
     from lightning.pytorch.callbacks import ModelCheckpoint
-    checkpoint = ModelCheckpoint(dirpath=str(args.output_dir / "checkpoints"), every_n_train_steps=1000, save_top_k=-1, save_last=True, enable_version_counter=False)
-    trainer = Trainer(accelerator="cuda", devices=args.devices, num_nodes=1, precision="bf16-mixed", strategy=DeepSpeedStrategy(), max_steps=args.max_steps, default_root_dir=str(args.output_dir), accumulate_grad_batches=1, gradient_clip_val=1.0, log_every_n_steps=10, val_check_interval=1000, check_val_every_n_epoch=None, limit_val_batches=args.val_batches, callbacks=[checkpoint], enable_checkpointing=True)
+    checkpoint = ModelCheckpoint(dirpath=str(args.checkpoint_dir), every_n_train_steps=1000, save_top_k=-1, save_last=True, enable_version_counter=False)
+    callbacks = [checkpoint, SuccessEvaluationCallback(args.success_eval_json)]
+    trainer = Trainer(
+        accelerator="cuda", devices=args.devices, num_nodes=1, precision="bf16-mixed",
+        strategy=DeepSpeedStrategy(), max_steps=args.max_steps, default_root_dir=str(args.log_dir),
+        accumulate_grad_batches=args.gradient_accumulation, gradient_clip_val=1.0, log_every_n_steps=10,
+        val_check_interval=1000, check_val_every_n_epoch=None, limit_val_batches=args.val_batches,
+        callbacks=callbacks, enable_checkpointing=True,
+    )
     trainer.fit(runner, datamodule=data)
 
 

@@ -1,0 +1,25 @@
+experiment: official_posttrain_baseline
+entrypoint: train_posttrain_baseline.py
+manifest: /data-cfs/data3/shurenbin/Xiaomi-Robotics-Spatial/train/manifests/robocasa365_sf10/train.jsonl
+dataset_root: /data-cfs/data3/datasets/robocasa365-datasets/pretrain
+base_checkpoint: /data-cfs/data3/models/Xiaomi-Robotics-1-5B/model_states.pt
+processor: ./processor
+tasks: 10
+history: 4
+interval: 2
+views: [LEFT, RIGHT, WRIST]
+crop_ratio: 0.95
+action_horizon: 16
+per_gpu_batch_size: 24
+num_gpus: 2
+global_batch_size: 48
+gradient_accumulation: 1
+max_steps: 20000
+checkpoint_every_steps: 1000
+validation_every_steps: 1000
+val_batches: 16
+official_loss: flow + frequency + choice + score
+spatial_forcing: false
+esm: disabled
+logs: ./logs/baseline
+checkpoints: ./checkpoints/baseline

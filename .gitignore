@@ -93,6 +93,13 @@ venv.bak/
 .vscode/
 *.sublime-workspace
 
+# ignore xr1 runs directory
+xr1/runs/
+xr1/diagnostics/
+
+# ignore all backup files
+*.bak
+
 # Node.js
 node_modules/
 npm-debug.log*
